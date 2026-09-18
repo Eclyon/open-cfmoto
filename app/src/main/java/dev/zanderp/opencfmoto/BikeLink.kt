@@ -20,6 +20,26 @@ import java.net.Inet4Address
  * Matches the existing process-global style ([AaVideoBridge], [ProjectionHolder], [BikeProfileHolder]).
  */
 object BikeLink {
+    enum class Backend {
+        EASYCONN,
+        EYLINK,
+    }
+
+    @Volatile var eylink: EylinkLink? = null
+    @Volatile private var backend: Backend = Backend.EASYCONN
+
+    @Synchronized
+    fun selectBackend(context: Context, useEylink: Boolean) {
+        appContext = context.applicationContext
+        backend = if (useEylink) Backend.EYLINK else Backend.EASYCONN
+
+        if (useEylink && eylink == null) {
+            eylink = EylinkLink(appContext!!, LogBus::log)
+        }
+
+        LogBus.log("bike backend = $backend")
+    }
+
     @Volatile var prober: EasyConnProber? = null
     @Volatile private var appContext: Context? = null
 
@@ -89,21 +109,71 @@ object BikeLink {
 
     private fun maybeStartProbe() {
         if (proberStarted || !aaVideoSteady || !networkReady) return
-        val p = prober ?: return
+
         proberStarted = true
+
         appContext?.let { ctx ->
             if (BikeWifi.rebindProcessToBike(ctx)) {
-                LogBus.log("→ process bound to bike Wi-Fi (AA video is live)")
+                LogBus.log("process bound to bike Wi-Fi (AA video is live)")
             }
         }
-        LogBus.log("→ AA video + bike Wi-Fi both ready — starting EasyConn PXC flow …")
+
         ConnectionState.set(Phase.PXC_CONNECTING)
-        appContext?.let { DashClockBle.start(it) }
-        try {
-            p.start(bikeNetwork, gatewayOverride = p2pGatewayIp, bindIpOverride = p2pBindIp)
-        } catch (e: Exception) {
-            LogBus.log("prober start failed: $e")
-            ConnectionState.set(Phase.ERROR, "prober start failed")
+
+        when (backend) {
+            Backend.EASYCONN -> {
+                val p = prober
+                if (p == null) {
+                    proberStarted = false
+                    LogBus.log("EasyConn backend selected but prober is null")
+                    ConnectionState.set(Phase.ERROR, "EasyConn prober unavailable")
+                    return
+                }
+
+                LogBus.log("AA video + bike Wi-Fi ready; starting EasyConn PXC flow")
+                appContext?.let { DashClockBle.start(it) }
+
+                try {
+                    p.start(
+                        bikeNetwork,
+                        gatewayOverride = p2pGatewayIp,
+                        bindIpOverride = p2pBindIp,
+                    )
+                } catch (e: Exception) {
+                    LogBus.log("prober start failed: $e")
+                    ConnectionState.set(Phase.ERROR, "prober start failed")
+                }
+            }
+
+            Backend.EYLINK -> {
+                val link = eylink
+                val gateway = p2pGatewayIp
+
+                if (link == null || gateway == null) {
+                    proberStarted = false
+                    LogBus.log("Eylink backend missing link or P2P gateway")
+                    ConnectionState.set(Phase.ERROR, "Eylink P2P endpoint unavailable")
+                    return
+                }
+
+                LogBus.log("AA video + Kove P2P ready; starting Eylink flow")
+
+                val ok = try {
+                    link.connectAndStream(
+                        host = gateway,
+                        network = bikeNetwork,
+                        bindIp = p2pBindIp,
+                    )
+                } catch (e: Exception) {
+                    LogBus.log("Eylink start failed: $e")
+                    false
+                }
+
+                if (!ok) {
+                    proberStarted = false
+                    ConnectionState.set(Phase.ERROR, "Eylink connection failed")
+                }
+            }
         }
     }
 

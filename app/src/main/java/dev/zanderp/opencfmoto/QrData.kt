@@ -34,7 +34,10 @@ data class QrData(
     val modelId: String?,
     val sn: String?,
     val channel: String?,
+    val eylinkBleName: String? = null,
+    val eylinkKey: String? = null,
 ) {
+    val isEylink: Boolean get() = !eylinkKey.isNullOrBlank() && !eylinkBleName.isNullOrBlank()
     val supportsAp: Boolean get() = (action and 1) != 0 || (action and 2) != 0
     val supportsP2p: Boolean get() = (action and 8) != 0
     /** Bit7 / empty SoftAP creds — rider enables Android hotspot; dash joins the phone. */
@@ -45,6 +48,7 @@ data class QrData(
         fun parse(raw: String): QrData? {
             val trimmed = raw.trim()
             if (trimmed.isEmpty()) return null
+            parseEylink(trimmed)?.let { return it }
             parseCarbit(trimmed)?.let { return it }
             parseCarbitToken(trimmed)?.let { return it }
             parseMotoMorini(trimmed)?.let { return it }
@@ -52,6 +56,35 @@ data class QrData(
             return null
         }
 
+        /**
+         * Eylink / Kove Wi-Fi Direct pairing QR.
+         *
+         * Eylink uses `name` as the Wi-Fi P2P device name, `device` as the BLE name,
+         * and carries its own device id in `mac` (not necessarily a Wi-Fi MAC address).
+         */
+        private fun parseEylink(raw: String): QrData? {
+            val q = queryParams(raw)
+            if (!q["productid"].equals("EYLINK", ignoreCase = true)) return null
+
+            val p2pName = q["name"]?.trim().orEmpty()
+            val bleName = q["device"]?.trim().orEmpty()
+            val key = q["key"]?.trim().orEmpty()
+            if (p2pName.isEmpty() || bleName.isEmpty() || key.isEmpty()) return null
+
+            return QrData(
+                ssid = q["ssid"]?.trim().orEmpty().ifEmpty { p2pName },
+                pwd = q["pwd"].orEmpty(),
+                auth = null,
+                mac = q["mac"]?.trim()?.takeIf { it.isNotEmpty() },
+                name = p2pName,
+                action = 8, // Wi-Fi P2P
+                modelId = q["productid"],
+                sn = null,
+                channel = null,
+                eylinkBleName = bleName,
+                eylinkKey = key,
+            )
+        }
         /**
          * Classic Carbit / EasyConnect query params. SoftAP QRs carry `ssid=` + `pwd=`.
          * Phone-hotspot QRs (Zontes etc.) often only carry `action=128` + `bm=` (MAC) — no ssid/pwd.

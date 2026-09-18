@@ -1,4 +1,4 @@
-﻿package dev.zanderp.opencfmoto
+package dev.zanderp.opencfmoto
 
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Adapted from eugen0309/open-cfmoto.
@@ -35,11 +35,11 @@ import kotlin.math.abs
  *     group the way there is for a specifier join). Instead the caller binds its sockets to the
  *     phone's P2P interface IP, which we hand back via [onConnected]. The 192.168.49.0/24 subnet
  *     is on-link, so binding the source IP is enough to route over the P2P interface. A bonus is
- *     that Android Auto / GMS keep using cellular for map tiles â€” no VPN, no route capture.
+ *     that Android Auto / GMS keep using cellular for map tiles ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â no VPN, no route capture.
  *
- * âš ï¸ This helper logs verbosely (raw peers, group info, addresses) so a single
- * bike session reveals what actually happens and what â€” if anything â€” needs correcting. Follow
- * the project's "implement â†’ one logged bike session â†’ adjust" loop (see docs/00 and docs/01 Â§7).
+ * ÃƒÂ¢Ã…Â¡Ã‚Â ÃƒÂ¯Ã‚Â¸Ã‚Â This helper logs verbosely (raw peers, group info, addresses) so a single
+ * bike session reveals what actually happens and what ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â if anything ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â needs correcting. Follow
+ * the project's "implement ÃƒÂ¢Ã¢â‚¬Â Ã¢â‚¬â„¢ one logged bike session ÃƒÂ¢Ã¢â‚¬Â Ã¢â‚¬â„¢ adjust" loop (see docs/00 and docs/01 Ãƒâ€šÃ‚Â§7).
  */
 object BikeWifiP2p {
 
@@ -102,17 +102,41 @@ object BikeWifiP2p {
         mgr.discoverPeers(chan, object : WifiP2pManager.ActionListener {
             override fun onSuccess() { log("$TAG discoverPeers: started") }
             override fun onFailure(reason: Int) {
-                log("$TAG discoverPeers: failed (${reasonStr(reason)}) — continuing with MAC/credential join")
+                log("$TAG discoverPeers: failed (${reasonStr(reason)}) Ã¢â‚¬â€ continuing with MAC/credential join")
                 // Still try MAC immediately; some stacks accept connect() without a prior discovery.
                 attemptMacJoin(mgr, chan, qr, log)
             }
         })
 
+        if (qr.isEylink) {
+            thread(name = "EylinkP2pDiscoveryRetry", isDaemon = true) {
+                repeat(4) { attempt ->
+                    try { Thread.sleep(5_000L) } catch (_: InterruptedException) { return@thread }
+                    if (!active || connected || connectIssued || channel !== chan) return@thread
+                    try {
+                        log("$TAG Eylink: discovery retry ${attempt + 1}/4")
+                        mgr.discoverPeers(chan, object : WifiP2pManager.ActionListener {
+                            override fun onSuccess() {
+                                log("$TAG Eylink: discovery retry ${attempt + 1} started")
+                            }
+                            override fun onFailure(reason: Int) {
+                                log("$TAG Eylink: discovery retry ${attempt + 1} failed (${reasonStr(reason)})")
+                            }
+                        })
+                    } catch (e: Exception) {
+                        log("$TAG Eylink: discovery retry exception ${e.message}")
+                    }
+                }
+            }
+        }
+
         // Prefer credential join when the SSID is a real P2P group name; otherwise go straight to MAC.
-        if (qr.ssid.startsWith("DIRECT-", ignoreCase = true)) {
+        if (qr.isEylink) {
+            log("$TAG Eylink: waiting for exact P2P peer name '${qr.name}'")
+        } else if (qr.ssid.startsWith("DIRECT-", ignoreCase = true)) {
             attemptCredentialJoin(mgr, chan, qr, log)
         } else {
-            log("$TAG SSID '${qr.ssid}' is not DIRECT-* — joining by QR MAC / discovered peer")
+            log("$TAG SSID '${qr.ssid}' is not DIRECT-* Ã¢â‚¬â€ joining by QR MAC / discovered peer")
             attemptMacJoin(mgr, chan, qr, log)
         }
 
@@ -127,7 +151,7 @@ object BikeWifiP2p {
         log: (String) -> Unit,
     ) {
         if (qr.pwd.isBlank()) {
-            log("$TAG credential-join skipped — empty passphrase")
+            log("$TAG credential-join skipped Ã¢â‚¬â€ empty passphrase")
             attemptMacJoin(mgr, chan, qr, log)
             return
         }
@@ -144,14 +168,14 @@ object BikeWifiP2p {
             return
         }
 
-        log("$TAG connect(): joining group name='${qr.ssid}' as legacy client …")
+        log("$TAG connect(): joining group name='${qr.ssid}' as legacy client Ã¢â‚¬Â¦")
         connectIssued = true
         mgr.connect(chan, config, object : WifiP2pManager.ActionListener {
             override fun onSuccess() {
-                log("$TAG connect(): credential request accepted — waiting for group to form")
+                log("$TAG connect(): credential request accepted Ã¢â‚¬â€ waiting for group to form")
             }
             override fun onFailure(reason: Int) {
-                log("$TAG connect(): credential failed (${reasonStr(reason)}) — trying MAC")
+                log("$TAG connect(): credential failed (${reasonStr(reason)}) Ã¢â‚¬â€ trying MAC")
                 connectIssued = false
                 attemptMacJoin(mgr, chan, qr, log)
             }
@@ -170,47 +194,79 @@ object BikeWifiP2p {
         log: (String) -> Unit,
     ) {
         if (!active || connected) return
+
         val mac = normalizeMac(qr.mac)
         if (mac == null) {
-            log("$TAG MAC-join skipped — QR has no usable mac=")
+            log("$TAG MAC-join skipped Ã¢â‚¬â€ QR has no usable mac=")
             return
         }
+
         if (connectIssued) return
-        // Some stacks reject connect() while discovery is still running (Pixel ERROR).
-        try {
-            mgr.stopPeerDiscovery(chan, object : WifiP2pManager.ActionListener {
-                override fun onSuccess() { log("$TAG stopPeerDiscovery: ok (before MAC join)") }
-                override fun onFailure(reason: Int) {
-                    log("$TAG stopPeerDiscovery: ${reasonStr(reason)} — connecting anyway")
-                }
-            })
-        } catch (e: Exception) {
-            log("$TAG stopPeerDiscovery: ${e.message}")
-        }
+
         val config = WifiP2pConfig().apply {
             deviceAddress = mac
             wps.setup = WpsInfo.PBC
         }
-        log("$TAG connect(): joining peer MAC=$mac (WPS PBC) …")
-        connectIssued = true
-        mgr.connect(chan, config, object : WifiP2pManager.ActionListener {
-            override fun onSuccess() {
-                log("$TAG connect(): MAC request accepted — waiting for group to form")
-            }
-            override fun onFailure(reason: Int) {
-                log("$TAG connect(): MAC failed (${reasonStr(reason)}) — will retry if peer appears")
+
+        fun doConnect() {
+            if (!active || connected || connectIssued) return
+
+            log("$TAG connect(): joining peer MAC=$mac (WPS PBC) Ã¢â‚¬Â¦")
+            connectIssued = true
+
+            try {
+                mgr.connect(chan, config, object : WifiP2pManager.ActionListener {
+                    override fun onSuccess() {
+                        log("$TAG connect(): MAC request accepted Ã¢â‚¬â€ waiting for group to form")
+                    }
+
+                    override fun onFailure(reason: Int) {
+                        log("$TAG connect(): MAC failed (${reasonStr(reason)}) Ã¢â‚¬â€ will retry if peer appears")
+                        connectIssued = false
+
+                        try {
+                            mgr.discoverPeers(chan, object : WifiP2pManager.ActionListener {
+                                override fun onSuccess() {
+                                    log("$TAG discoverPeers: restarted after MAC fail")
+                                }
+
+                                override fun onFailure(r: Int) {
+                                    log("$TAG discoverPeers restart failed (${reasonStr(r)})")
+                                }
+                            })
+                        } catch (_: Exception) {}
+                    }
+                })
+            } catch (e: Exception) {
                 connectIssued = false
-                // Re-arm discovery so PEERS_CHANGED can retry the MAC join.
-                try {
-                    mgr.discoverPeers(chan, object : WifiP2pManager.ActionListener {
-                        override fun onSuccess() { log("$TAG discoverPeers: restarted after MAC fail") }
-                        override fun onFailure(r: Int) {
-                            log("$TAG discoverPeers restart failed (${reasonStr(r)})")
-                        }
-                    })
-                } catch (_: Exception) {}
+                log("$TAG connect(): exception ${e.message}")
             }
-        })
+        }
+
+        if (qr.isEylink) {
+            log("$TAG Eylink: peer discovered - connecting directly while discovery is active")
+            doConnect()
+            return
+        }
+
+        try {
+            log("$TAG stopPeerDiscovery: preparing MAC join")
+
+            mgr.stopPeerDiscovery(chan, object : WifiP2pManager.ActionListener {
+                override fun onSuccess() {
+                    log("$TAG stopPeerDiscovery: ok Ã¢â‚¬â€ now connecting")
+                    doConnect()
+                }
+
+                override fun onFailure(reason: Int) {
+                    log("$TAG stopPeerDiscovery: ${reasonStr(reason)} Ã¢â‚¬â€ connecting anyway")
+                    doConnect()
+                }
+            })
+        } catch (e: Exception) {
+            log("$TAG stopPeerDiscovery: ${e.message} Ã¢â‚¬â€ connecting anyway")
+            doConnect()
+        }
     }
 
     private fun registerReceiver(
@@ -237,7 +293,7 @@ object BikeWifiP2p {
                         val enabled = intent.getIntExtra(WifiP2pManager.EXTRA_WIFI_STATE, -1) ==
                             WifiP2pManager.WIFI_P2P_STATE_ENABLED
                         log("$TAG state: Wi-Fi P2P ${if (enabled) "ENABLED" else "DISABLED"}")
-                        if (!enabled) fail(onFailed, log, "Wi-Fi P2P is disabled — enable Wi-Fi and retry")
+                        if (!enabled) fail(onFailed, log, "Wi-Fi P2P is disabled Ã¢â‚¬â€ enable Wi-Fi and retry")
                     }
                     WifiP2pManager.WIFI_P2P_PEERS_CHANGED_ACTION -> {
                         mgr.requestPeers(chan) { peers ->
@@ -254,7 +310,11 @@ object BikeWifiP2p {
                                         "status=${deviceStatus(d.status)} isGO=${d.isGroupOwner}",
                                 )
                                 val peerMac = normalizeMac(d.deviceAddress)
-                                if (wantMac != null && peerMac != null && macMatches(wantMac, peerMac)) {
+                                if (qr.isEylink) {
+                                    if (matched == null && d.deviceName == qr.name) {
+                                        matched = d
+                                    }
+                                } else if (wantMac != null && peerMac != null && macMatches(wantMac, peerMac)) {
                                     matched = d
                                 } else if (
                                     matched == null &&
@@ -267,7 +327,7 @@ object BikeWifiP2p {
                             val peer = matched ?: return@requestPeers
                             if (connectIssued) return@requestPeers
                             log(
-                                "$TAG found matching peer '${peer.deviceName}' (${peer.deviceAddress}) — connecting",
+                                "$TAG found matching peer '${peer.deviceName}' (${peer.deviceAddress}) Ã¢â‚¬â€ connecting",
                             )
                             // Prefer the shared MAC-join path (stops discovery first).
                             attemptMacJoin(
@@ -298,7 +358,7 @@ object BikeWifiP2p {
         registerSystemReceiver(ctx, rx, filter)
     }
 
-    /** Normalize `aa:bb:…` / `aabb…` to lowercase colon form; null if not 12 hex digits. */
+    /** Normalize `aa:bb:Ã¢â‚¬Â¦` / `aabbÃ¢â‚¬Â¦` to lowercase colon form; null if not 12 hex digits. */
     private fun normalizeMac(raw: String?): String? {
         if (raw.isNullOrBlank()) return null
         val hex = raw.filter { it.isDigit() || it in 'a'..'f' || it in 'A'..'F' }
@@ -307,7 +367,7 @@ object BikeWifiP2p {
     }
 
     /**
-     * Exact match, or Wi‑Fi/BT locally-administered offset (±1 on the last octet) seen on some
+     * Exact match, or WiÃ¢â‚¬â€˜Fi/BT locally-administered offset (Ã‚Â±1 on the last octet) seen on some
      * Carbit units where the QR `mac=` and the P2P device address differ by one.
      */
     private fun macMatches(want: String, peer: String): Boolean {
@@ -333,7 +393,7 @@ object BikeWifiP2p {
     ) {
         if (info.isGroupOwner) {
             // We should be the client, not the GO. If we became GO the bike won't connect back.
-            log("$TAG !! WE became the Group Owner â€” the bike is expected to be the GO. " +
+            log("$TAG !! WE became the Group Owner ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â the bike is expected to be the GO. " +
                 "This usually means the join fell back to creating a new group. Share this log.")
         }
         val gateway = info.groupOwnerAddress as? Inet4Address
@@ -354,7 +414,7 @@ object BikeWifiP2p {
                 if (!active || connected) return@thread
                 connected = true
                 cancelTimeout()
-                log("$TAG *** connected: phone=${bindIp.hostAddress} bike(GO)=${gateway.hostAddress} â€” starting PXC ***")
+                log("$TAG *** connected: phone=${bindIp.hostAddress} bike(GO)=${gateway.hostAddress} ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â starting PXC ***")
                 onConnected(bindIp, gateway)
             }
         }
@@ -412,12 +472,12 @@ object BikeWifiP2p {
         onFailed(reason)
     }
 
-    /** Stay in the Wi-Fi Direct group (dash clock) — do not [removeGroup]. */
+    /** Stay in the Wi-Fi Direct group (dash clock) Ã¢â‚¬â€ do not [removeGroup]. */
     fun park(log: (String) -> Unit) {
         active = false
         connectIssued = false
         cancelTimeout()
-        log("$TAG parked — group kept (keep Wi-Fi after disconnect)")
+        log("$TAG parked Ã¢â‚¬â€ group kept (keep Wi-Fi after disconnect)")
     }
 
     fun stop(log: (String) -> Unit) {

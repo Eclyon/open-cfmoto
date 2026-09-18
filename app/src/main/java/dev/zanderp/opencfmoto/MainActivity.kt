@@ -1029,6 +1029,7 @@ class MainActivity : AppCompatActivity() {
     private fun joinWifi(qr: QrData, gateOnAaSteady: Boolean) {
         if (!WifiGate.ensureEnabledOrPrompt(this)) return
         ConnectionState.set(Phase.JOINING_WIFI)
+        BikeLink.selectBackend(applicationContext, qr.isEylink)
         val transport = AppSettings.transport(this)
         // Phone-hosts-hotspot (Zontes action=128 / no SoftAP pwd): dash joins the phone.
         if (qr.supportsPhoneHotspot && qr.pwd.isEmpty()) {
@@ -1263,6 +1264,9 @@ class MainActivity : AppCompatActivity() {
                 if (gateOnAaSteady) {
                     LogBus.log("→ P2P bound (waiting for AA video); bike=${gatewayIp.hostAddress}")
                     BikeLink.markP2pReady(bindIp, gatewayIp)
+                } else if (qr.isEylink) {
+                    LogBus.log("Eylink direct-mirror path is not wired yet; Android Auto handoff is required")
+                    ConnectionState.set(Phase.ERROR, "Eylink Android Auto path required")
                 } else {
                     ConnectionState.set(Phase.PXC_CONNECTING)
                     LogBus.log("→ P2P bound; starting EasyConn PXC flow …")
@@ -1278,7 +1282,7 @@ class MainActivity : AppCompatActivity() {
                 }
             },
             onFailed = { reason ->
-                if (qr.pwd.isEmpty() || qr.ssid.startsWith("PHONE-HOTSPOT", ignoreCase = true)) {
+                if (qr.isEylink || qr.pwd.isEmpty() || qr.ssid.startsWith("PHONE-HOTSPOT", ignoreCase = true)) {
                     LogBus.log("P2P join failed: $reason — no SoftAP credentials to fall back to")
                     ConnectionState.set(Phase.ERROR, "Wi‑Fi Direct failed")
                     return@connect
