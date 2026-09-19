@@ -1,4 +1,4 @@
-package dev.zanderp.opencfmoto
+﻿package dev.zanderp.opencfmoto
 
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Adapted from eugen0309/open-cfmoto.
@@ -14,6 +14,7 @@ import android.net.wifi.p2p.WifiP2pDevice
 import android.net.wifi.p2p.WifiP2pInfo
 import android.net.wifi.p2p.WifiP2pManager
 import android.os.Looper
+import android.os.SystemClock
 import java.net.Inet4Address
 import java.net.InetAddress
 import java.net.NetworkInterface
@@ -35,11 +36,11 @@ import kotlin.math.abs
  *     group the way there is for a specifier join). Instead the caller binds its sockets to the
  *     phone's P2P interface IP, which we hand back via [onConnected]. The 192.168.49.0/24 subnet
  *     is on-link, so binding the source IP is enough to route over the P2P interface. A bonus is
- *     that Android Auto / GMS keep using cellular for map tiles ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â no VPN, no route capture.
+ *     that Android Auto / GMS keep using cellular for map tiles â€” no VPN, no route capture.
  *
- * ÃƒÂ¢Ã…Â¡Ã‚Â ÃƒÂ¯Ã‚Â¸Ã‚Â This helper logs verbosely (raw peers, group info, addresses) so a single
- * bike session reveals what actually happens and what ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â if anything ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â needs correcting. Follow
- * the project's "implement ÃƒÂ¢Ã¢â‚¬Â Ã¢â‚¬â„¢ one logged bike session ÃƒÂ¢Ã¢â‚¬Â Ã¢â‚¬â„¢ adjust" loop (see docs/00 and docs/01 Ãƒâ€šÃ‚Â§7).
+ * âš ï¸ This helper logs verbosely (raw peers, group info, addresses) so a single
+ * bike session reveals what actually happens and what â€” if anything â€” needs correcting. Follow
+ * the project's "implement â†’ one logged bike session â†’ adjust" loop (see docs/00 and docs/01 Â§7).
  */
 object BikeWifiP2p {
 
@@ -58,6 +59,8 @@ object BikeWifiP2p {
     @Volatile private var connected = false
     @Volatile private var connectIssued = false
     @Volatile private var timeoutThread: Thread? = null
+    @Volatile private var eylinkDiscoveryThread: Thread? = null
+    @Volatile private var eylinkJoinStartedAt = 0L
 
     /** True only while Android reports an active Wi-Fi Direct group. */
     val isConnected: Boolean get() = active && connected
@@ -71,6 +74,7 @@ object BikeWifiP2p {
         context: Context,
         qr: QrData,
         onConnected: (bindIp: Inet4Address, gatewayIp: Inet4Address) -> Unit,
+        onDisconnected: () -> Unit,
         onFailed: (reason: String) -> Unit,
         log: (String) -> Unit,
         // How long to wait for a P2P group before failing over. When the QR also advertises a SoftAP
@@ -93,42 +97,26 @@ object BikeWifiP2p {
 
         log("$TAG starting Wi-Fi Direct connect")
         log("$TAG   qr ssid='${qr.ssid}' mac=${qr.mac} action=${qr.action} (p2p=${qr.supportsP2p} ap=${qr.supportsAp})")
-        log("$TAG   expecting bike GO at 192.168.49.1; phone will be a P2P client")
+        if (qr.isEylink) {
+            log("$TAG   EyLink GO address will come from P2P connection info; phone will be a P2P client")
+        } else {
+            log("$TAG   expecting bike GO at 192.168.49.1; phone will be a P2P client")
+        }
 
-        registerReceiver(ctx, mgr, chan, qr, onConnected, onFailed, log)
+        registerReceiver(ctx, mgr, chan, qr, onConnected, onDisconnected, onFailed, log)
 
         // Peer discovery is required on many phones before connect(), and surfaces the bike so we
         // can join by MAC when the QR SSID is not a DIRECT-* group name (Zontes / Carbit action=8).
         mgr.discoverPeers(chan, object : WifiP2pManager.ActionListener {
             override fun onSuccess() { log("$TAG discoverPeers: started") }
             override fun onFailure(reason: Int) {
-                log("$TAG discoverPeers: failed (${reasonStr(reason)}) Ã¢â‚¬â€ continuing with MAC/credential join")
+                log("$TAG discoverPeers: failed (${reasonStr(reason)}) — continuing with MAC/credential join")
                 // Still try MAC immediately; some stacks accept connect() without a prior discovery.
                 attemptMacJoin(mgr, chan, qr, log)
             }
         })
 
-        if (qr.isEylink) {
-            thread(name = "EylinkP2pDiscoveryRetry", isDaemon = true) {
-                repeat(4) { attempt ->
-                    try { Thread.sleep(5_000L) } catch (_: InterruptedException) { return@thread }
-                    if (!active || connected || connectIssued || channel !== chan) return@thread
-                    try {
-                        log("$TAG Eylink: discovery retry ${attempt + 1}/4")
-                        mgr.discoverPeers(chan, object : WifiP2pManager.ActionListener {
-                            override fun onSuccess() {
-                                log("$TAG Eylink: discovery retry ${attempt + 1} started")
-                            }
-                            override fun onFailure(reason: Int) {
-                                log("$TAG Eylink: discovery retry ${attempt + 1} failed (${reasonStr(reason)})")
-                            }
-                        })
-                    } catch (e: Exception) {
-                        log("$TAG Eylink: discovery retry exception ${e.message}")
-                    }
-                }
-            }
-        }
+        if (qr.isEylink) startEylinkDiscovery(mgr, chan, log, recovery = false)
 
         // Prefer credential join when the SSID is a real P2P group name; otherwise go straight to MAC.
         if (qr.isEylink) {
@@ -136,11 +124,85 @@ object BikeWifiP2p {
         } else if (qr.ssid.startsWith("DIRECT-", ignoreCase = true)) {
             attemptCredentialJoin(mgr, chan, qr, log)
         } else {
-            log("$TAG SSID '${qr.ssid}' is not DIRECT-* Ã¢â‚¬â€ joining by QR MAC / discovered peer")
+            log("$TAG SSID '${qr.ssid}' is not DIRECT-* — joining by QR MAC / discovered peer")
             attemptMacJoin(mgr, chan, qr, log)
         }
 
         startTimeout(onFailed, log, timeoutMs)
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun startEylinkDiscovery(
+        mgr: WifiP2pManager,
+        chan: WifiP2pManager.Channel,
+        log: (String) -> Unit,
+        recovery: Boolean,
+    ) {
+        cancelEylinkDiscovery()
+        val worker = thread(name = "EylinkP2pDiscoveryRetry", isDaemon = true, start = false) {
+            var attempt = 0
+            if (recovery) log("$TAG Eylink: recovery cycle start")
+            while (active && !connected && channel === chan &&
+                eylinkDiscoveryThread === Thread.currentThread()) {
+                // Initial discovery is issued by connect(); recovery starts immediately.
+                if (!recovery || attempt > 0) {
+                    try { Thread.sleep(5_000L) } catch (_: InterruptedException) { return@thread }
+                }
+                if (!active || connected || channel !== chan ||
+                    eylinkDiscoveryThread !== Thread.currentThread()) return@thread
+                if (connectIssued) {
+                    val startedAt = eylinkJoinStartedAt
+                    if (startedAt == 0L || SystemClock.elapsedRealtime() - startedAt < CONNECT_TIMEOUT_MS) {
+                        if (attempt == 0) attempt = 1
+                        continue
+                    }
+                    log("$TAG Eylink: join deadline expired")
+                    try {
+                        mgr.cancelConnect(chan, object : WifiP2pManager.ActionListener {
+                            override fun onSuccess() {}
+                            override fun onFailure(reason: Int) {
+                                log("$TAG Eylink: cancelConnect failed (" + reasonStr(reason) + ")")
+                            }
+                        })
+                    } catch (e: Exception) {
+                        log("$TAG Eylink: cancelConnect exception " + e.message)
+                    }
+                    if (!active || connected || channel !== chan ||
+                        eylinkDiscoveryThread !== Thread.currentThread()) return@thread
+                    eylinkJoinStartedAt = 0L
+                    connectIssued = false
+                    log("$TAG Eylink: join cancelled/reset")
+                    attempt = 0
+                    log("$TAG Eylink: recovery restarted")
+                }
+                if (!recovery && attempt >= 4) return@thread
+                if (recovery && attempt >= 4) {
+                    attempt = 0
+                    log("$TAG Eylink: recovery restarted")
+                }
+                attempt++
+                log("$TAG Eylink: discover attempt $attempt/4")
+                try {
+                    mgr.discoverPeers(chan, object : WifiP2pManager.ActionListener {
+                        override fun onSuccess() {}
+                        override fun onFailure(reason: Int) {
+                            if (active && channel === chan) {
+                                log("$TAG Eylink: discovery failed (" + reasonStr(reason) + ")")
+                            }
+                        }
+                    })
+                } catch (e: Exception) {
+                    log("$TAG Eylink: discovery exception " + e.message)
+                }
+            }
+        }
+        eylinkDiscoveryThread = worker
+        worker.start()
+    }
+
+    private fun cancelEylinkDiscovery() {
+        eylinkDiscoveryThread?.interrupt()
+        eylinkDiscoveryThread = null
     }
 
     @SuppressLint("MissingPermission")
@@ -151,7 +213,7 @@ object BikeWifiP2p {
         log: (String) -> Unit,
     ) {
         if (qr.pwd.isBlank()) {
-            log("$TAG credential-join skipped Ã¢â‚¬â€ empty passphrase")
+            log("$TAG credential-join skipped — empty passphrase")
             attemptMacJoin(mgr, chan, qr, log)
             return
         }
@@ -168,14 +230,14 @@ object BikeWifiP2p {
             return
         }
 
-        log("$TAG connect(): joining group name='${qr.ssid}' as legacy client Ã¢â‚¬Â¦")
+        log("$TAG connect(): joining group name='${qr.ssid}' as legacy client …")
         connectIssued = true
         mgr.connect(chan, config, object : WifiP2pManager.ActionListener {
             override fun onSuccess() {
-                log("$TAG connect(): credential request accepted Ã¢â‚¬â€ waiting for group to form")
+                log("$TAG connect(): credential request accepted — waiting for group to form")
             }
             override fun onFailure(reason: Int) {
-                log("$TAG connect(): credential failed (${reasonStr(reason)}) Ã¢â‚¬â€ trying MAC")
+                log("$TAG connect(): credential failed (${reasonStr(reason)}) — trying MAC")
                 connectIssued = false
                 attemptMacJoin(mgr, chan, qr, log)
             }
@@ -197,11 +259,25 @@ object BikeWifiP2p {
 
         val mac = normalizeMac(qr.mac)
         if (mac == null) {
-            log("$TAG MAC-join skipped Ã¢â‚¬â€ QR has no usable mac=")
+            log("$TAG MAC-join skipped — QR has no usable mac=")
             return
         }
 
         if (connectIssued) return
+
+        if (!qr.isEylink) {
+            // Some stacks reject connect() while discovery is still running (Pixel ERROR).
+            try {
+                mgr.stopPeerDiscovery(chan, object : WifiP2pManager.ActionListener {
+                    override fun onSuccess() { log("$TAG stopPeerDiscovery: ok (before MAC join)") }
+                    override fun onFailure(reason: Int) {
+                        log("$TAG stopPeerDiscovery: ${reasonStr(reason)} — connecting anyway")
+                    }
+                })
+            } catch (e: Exception) {
+                log("$TAG stopPeerDiscovery: ${e.message}")
+            }
+        }
 
         val config = WifiP2pConfig().apply {
             deviceAddress = mac
@@ -209,19 +285,25 @@ object BikeWifiP2p {
         }
 
         fun doConnect() {
-            if (!active || connected || connectIssued) return
+            if (qr.isEylink && (!active || connected || connectIssued)) return
 
-            log("$TAG connect(): joining peer MAC=$mac (WPS PBC) Ã¢â‚¬Â¦")
+            log("$TAG connect(): joining peer MAC=$mac (WPS PBC) …")
+            if (qr.isEylink) {
+                if (channel !== chan) return
+                eylinkJoinStartedAt = SystemClock.elapsedRealtime()
+                log("$TAG Eylink: join issued")
+            }
             connectIssued = true
 
             try {
                 mgr.connect(chan, config, object : WifiP2pManager.ActionListener {
                     override fun onSuccess() {
-                        log("$TAG connect(): MAC request accepted Ã¢â‚¬â€ waiting for group to form")
+                        if (qr.isEylink) log("$TAG Eylink: join request accepted")
+                        log("$TAG connect(): MAC request accepted — waiting for group to form")
                     }
 
                     override fun onFailure(reason: Int) {
-                        log("$TAG connect(): MAC failed (${reasonStr(reason)}) Ã¢â‚¬â€ will retry if peer appears")
+                        log("$TAG connect(): MAC failed (${reasonStr(reason)}) — will retry if peer appears")
                         connectIssued = false
 
                         try {
@@ -238,6 +320,7 @@ object BikeWifiP2p {
                     }
                 })
             } catch (e: Exception) {
+                if (!qr.isEylink) throw e
                 connectIssued = false
                 log("$TAG connect(): exception ${e.message}")
             }
@@ -249,24 +332,7 @@ object BikeWifiP2p {
             return
         }
 
-        try {
-            log("$TAG stopPeerDiscovery: preparing MAC join")
-
-            mgr.stopPeerDiscovery(chan, object : WifiP2pManager.ActionListener {
-                override fun onSuccess() {
-                    log("$TAG stopPeerDiscovery: ok Ã¢â‚¬â€ now connecting")
-                    doConnect()
-                }
-
-                override fun onFailure(reason: Int) {
-                    log("$TAG stopPeerDiscovery: ${reasonStr(reason)} Ã¢â‚¬â€ connecting anyway")
-                    doConnect()
-                }
-            })
-        } catch (e: Exception) {
-            log("$TAG stopPeerDiscovery: ${e.message} Ã¢â‚¬â€ connecting anyway")
-            doConnect()
-        }
+        doConnect()
     }
 
     private fun registerReceiver(
@@ -275,6 +341,7 @@ object BikeWifiP2p {
         chan: WifiP2pManager.Channel,
         qr: QrData,
         onConnected: (Inet4Address, Inet4Address) -> Unit,
+        onDisconnected: () -> Unit,
         onFailed: (String) -> Unit,
         log: (String) -> Unit,
     ) {
@@ -293,7 +360,7 @@ object BikeWifiP2p {
                         val enabled = intent.getIntExtra(WifiP2pManager.EXTRA_WIFI_STATE, -1) ==
                             WifiP2pManager.WIFI_P2P_STATE_ENABLED
                         log("$TAG state: Wi-Fi P2P ${if (enabled) "ENABLED" else "DISABLED"}")
-                        if (!enabled) fail(onFailed, log, "Wi-Fi P2P is disabled Ã¢â‚¬â€ enable Wi-Fi and retry")
+                        if (!enabled) fail(onFailed, log, "Wi-Fi P2P is disabled — enable Wi-Fi and retry")
                     }
                     WifiP2pManager.WIFI_P2P_PEERS_CHANGED_ACTION -> {
                         mgr.requestPeers(chan) { peers ->
@@ -325,10 +392,16 @@ object BikeWifiP2p {
                                 }
                             }
                             val peer = matched ?: return@requestPeers
+                            if (qr.isEylink && channel !== chan) return@requestPeers
                             if (connectIssued) return@requestPeers
+                            if (qr.isEylink && peer.deviceAddress.isBlank()) {
+                                log("$TAG Eylink: matching peer has blank deviceAddress; waiting for discovery retry")
+                                return@requestPeers
+                            }
                             log(
-                                "$TAG found matching peer '${peer.deviceName}' (${peer.deviceAddress}) Ã¢â‚¬â€ connecting",
+                                "$TAG found matching peer '${peer.deviceName}' (${peer.deviceAddress}) — connecting",
                             )
+                            if (qr.isEylink) log("$TAG Eylink: peer found '" + peer.deviceName + "'")
                             // Prefer the shared MAC-join path (stops discovery first).
                             attemptMacJoin(
                                 mgr,
@@ -342,11 +415,27 @@ object BikeWifiP2p {
                         mgr.requestConnectionInfo(chan) { info ->
                             log("$TAG conn: groupFormed=${info.groupFormed} isGO=${info.isGroupOwner} " +
                                 "goAddr=${info.groupOwnerAddress?.hostAddress}")
+                            if (qr.isEylink && (!active || channel !== chan)) return@requestConnectionInfo
                             if (info.groupFormed && !connected) {
+                                if (qr.isEylink) {
+                                    log("$TAG Eylink: group formed")
+                                    cancelEylinkDiscovery()
+                                    eylinkJoinStartedAt = 0L
+                                }
                                 onGroupFormed(mgr, chan, info, onConnected, onFailed, log)
                             } else if (!info.groupFormed && connected) {
                                 connected = false
                                 log("$TAG group lost")
+
+                                if (qr.isEylink) {
+                                    connectIssued = false
+                                    onDisconnected()
+
+                                    if (active && channel === chan) {
+                                        eylinkJoinStartedAt = 0L
+                                        startEylinkDiscovery(mgr, chan, log, recovery = true)
+                                    }
+                                }
                             }
                         }
                     }
@@ -358,7 +447,7 @@ object BikeWifiP2p {
         registerSystemReceiver(ctx, rx, filter)
     }
 
-    /** Normalize `aa:bb:Ã¢â‚¬Â¦` / `aabbÃ¢â‚¬Â¦` to lowercase colon form; null if not 12 hex digits. */
+    /** Normalize `aa:bb:…` / `aabb…` to lowercase colon form; null if not 12 hex digits. */
     private fun normalizeMac(raw: String?): String? {
         if (raw.isNullOrBlank()) return null
         val hex = raw.filter { it.isDigit() || it in 'a'..'f' || it in 'A'..'F' }
@@ -367,7 +456,7 @@ object BikeWifiP2p {
     }
 
     /**
-     * Exact match, or WiÃ¢â‚¬â€˜Fi/BT locally-administered offset (Ã‚Â±1 on the last octet) seen on some
+     * Exact match, or Wi‑Fi/BT locally-administered offset (±1 on the last octet) seen on some
      * Carbit units where the QR `mac=` and the P2P device address differ by one.
      */
     private fun macMatches(want: String, peer: String): Boolean {
@@ -393,7 +482,7 @@ object BikeWifiP2p {
     ) {
         if (info.isGroupOwner) {
             // We should be the client, not the GO. If we became GO the bike won't connect back.
-            log("$TAG !! WE became the Group Owner ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â the bike is expected to be the GO. " +
+            log("$TAG !! WE became the Group Owner â€” the bike is expected to be the GO. " +
                 "This usually means the join fell back to creating a new group. Share this log.")
         }
         val gateway = info.groupOwnerAddress as? Inet4Address
@@ -414,7 +503,7 @@ object BikeWifiP2p {
                 if (!active || connected) return@thread
                 connected = true
                 cancelTimeout()
-                log("$TAG *** connected: phone=${bindIp.hostAddress} bike(GO)=${gateway.hostAddress} ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â starting PXC ***")
+                log("$TAG *** connected: phone=${bindIp.hostAddress} bike(GO)=${gateway.hostAddress} â€” starting PXC ***")
                 onConnected(bindIp, gateway)
             }
         }
@@ -468,16 +557,19 @@ object BikeWifiP2p {
         if (!active) return
         active = false
         cancelTimeout()
+        cancelEylinkDiscovery()
         log("$TAG FAILED: $reason")
         onFailed(reason)
     }
 
-    /** Stay in the Wi-Fi Direct group (dash clock) Ã¢â‚¬â€ do not [removeGroup]. */
+    /** Stay in the Wi-Fi Direct group (dash clock) — do not [removeGroup]. */
     fun park(log: (String) -> Unit) {
         active = false
         connectIssued = false
         cancelTimeout()
-        log("$TAG parked Ã¢â‚¬â€ group kept (keep Wi-Fi after disconnect)")
+        cancelEylinkDiscovery()
+        eylinkJoinStartedAt = 0L
+        log("$TAG parked — group kept (keep Wi-Fi after disconnect)")
     }
 
     fun stop(log: (String) -> Unit) {
@@ -485,6 +577,8 @@ object BikeWifiP2p {
         connected = false
         connectIssued = false
         cancelTimeout()
+        cancelEylinkDiscovery()
+        eylinkJoinStartedAt = 0L
         val ctx = appContext
         receiver?.let { r -> if (ctx != null) try { ctx.unregisterReceiver(r) } catch (_: Exception) {} }
         receiver = null

@@ -246,6 +246,7 @@ class EylinkLink(
 
         while (running) {
             val au = video?.pollFrame(1_500L)
+            if (!running) break
 
             if (au == null) {
                 idlePolls++
@@ -296,26 +297,55 @@ class EylinkLink(
     }
 
     /**
-     * Clean Eylink shutdown: explicit MIRROR_STOP before closing :11111, then stop heartbeat and
-     * close :11113. The shared AA VideoPipeline is owned by AndroidAutoService and is not stopped.
+     * Clean Eylink shutdown: interrupt workers, attempt MIRROR_STOP, close sockets and join.
+     * The shared AA VideoPipeline is owned by AndroidAutoService and is not stopped.
      */
     fun stop() {
         val wasRunning = running
         running = false
 
-        if (wasRunning) {
+        val heartbeat = heartbeatThread
+        val sender = sendThread
+        val vid = videoSocket
+        val ctrl = controlSocket
+        val current = Thread.currentThread()
+        var interrupted = false
+
+        fun joinWorker(worker: Thread?, timeoutMs: Long) {
+            if (worker == null || worker === current) return
             try {
-                val out = videoSocket?.getOutputStream()
-                if (out != null) {
+                worker.join(timeoutMs)
+            } catch (_: InterruptedException) {
+                interrupted = true
+            }
+        }
+
+        heartbeat?.interrupt()
+        sender?.interrupt()
+
+        // Give the sender a chance to exit before writing another protocol packet.
+        joinWorker(sender, 250L)
+        val mirrorStop = if (wasRunning && vid != null && sender?.isAlive != true) {
+            // Socket writes have no timeout; close the socket below if this attempt stalls.
+            thread(name = "eylink-mirror-stop", isDaemon = true) {
+                try {
+                    val out = vid.getOutputStream()
                     out.write(EylinkProtocol.mirrorStop())
                     out.flush()
                     log("[EYLINK] MIRROR_STOP sent")
-                }
-            } catch (_: Exception) {}
+                } catch (_: Exception) {}
+            }
+        } else {
+            null
         }
+        joinWorker(mirrorStop, 250L)
 
-        try { videoSocket?.close() } catch (_: Exception) {}
-        try { controlSocket?.close() } catch (_: Exception) {}
+        try { vid?.close() } catch (_: Exception) {}
+        try { ctrl?.close() } catch (_: Exception) {}
+
+        joinWorker(heartbeat, 1_000L)
+        joinWorker(sender, 1_000L)
+        joinWorker(mirrorStop, 1_000L)
 
         videoSocket = null
         controlSocket = null
@@ -326,6 +356,8 @@ class EylinkLink(
         video = null
         streamWidth = 0
         streamHeight = 0
+
+        if (interrupted) current.interrupt()
     }
 
     private fun openSocket(

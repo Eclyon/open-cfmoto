@@ -205,7 +205,7 @@ class AndroidAutoService : Service() {
         AaVideoBridge.onSteadyVideo = null
         // Don't bank the trip if the map HUD is still live — [TripAutoLog] keeps recording.
         try { TripAutoLog.sync(this) } catch (_: Exception) {}
-        try { BikeLink.prober?.stop() } catch (_: Exception) {}
+        BikeLink.stopBackend()
         try { mediaButtons?.stop() } catch (_: Exception) {}
         mediaButtons = null
         try { receiver?.stop() } catch (_: Exception) {}
@@ -243,8 +243,9 @@ class AndroidAutoService : Service() {
      * best-effort auto-resume; if AA doesn't come up in time we re-park (to keep battery low) and post
      * a tap-to-resume notification — [MainActivity] then finishes from the foreground (BAL-safe).
      */
-    private fun doResume() {
+    private fun doResume(p2pEndpoint: BikeLink.P2pEndpoint? = null) {
         if (!aaParked) return
+        if (p2pEndpoint != null && !BikeWifiP2p.isConnected) return
         aaParked = false
         wifiDownSince = 0L
         resumeSteadyReached = false
@@ -255,8 +256,11 @@ class AndroidAutoService : Service() {
         reacquireLocks()
         updateNotification(getString(R.string.notif_aa_title), getString(R.string.notif_aa_reconnecting))
 
-        startReceiver()
-        if (receiver == null) { resumeFailedFallback(); return }
+        // Preserve AP startup ordering; P2P must reset the gate and callback before AA starts.
+        if (p2pEndpoint == null) {
+            startReceiver()
+            if (receiver == null) { resumeFailedFallback(); return }
+        }
 
         BikeLink.beginHandoff(this)
         AaVideoBridge.onSteadyVideo = {
@@ -266,7 +270,16 @@ class AndroidAutoService : Service() {
             LogBus.log("→ Android Auto video is live (resume)")
             BikeLink.markAaVideoSteady()
         }
-        BikeLink.markWifiReady(BikeWifi.currentNetwork)
+        if (p2pEndpoint != null) {
+            startReceiver()
+            if (receiver == null || !BikeWifiP2p.isConnected) {
+                resumeFailedFallback()
+                return
+            }
+            BikeLink.markP2pReady(p2pEndpoint.bindIp, p2pEndpoint.gatewayIp)
+        } else {
+            BikeLink.markWifiReady(BikeWifi.currentNetwork)
+        }
         dev.zanderp.opencfmoto.aa.AaSelfMode.trigger(applicationContext, log = LogBus::log)
 
         // If AA can't self-start from the background (BAL), retry once then hand off to the foreground.
@@ -642,7 +655,7 @@ class AndroidAutoService : Service() {
      */
     private fun fullTeardown() {
         AaVideoBridge.onSteadyVideo = null
-        try { BikeLink.prober?.stop() } catch (_: Exception) {}
+        BikeLink.stopBackend()
         try { ProjectionHolder.projection?.stop() } catch (_: Exception) {}
         ProjectionHolder.projection = null
         try { ProjectionService.stop(applicationContext) } catch (_: Exception) {}
@@ -714,10 +727,10 @@ class AndroidAutoService : Service() {
         /** True while AA is parked (torn down, waiting for the bike's Wi-Fi to return). */
         val isParked: Boolean get() = active?.aaParked == true
 
-        /** Ask a parked service to rebuild AA and reconnect (called by [BikeWifi] on AP re-acquire). */
-        fun requestResume() {
+        /** Ask a parked service to rebuild AA, optionally restoring a newly formed P2P endpoint. */
+        fun requestResume(p2pEndpoint: BikeLink.P2pEndpoint? = null) {
             val svc = active ?: return
-            svc.watchdogHandler.post { svc.doResume() }
+            svc.watchdogHandler.post { svc.doResume(p2pEndpoint) }
         }
 
         /**

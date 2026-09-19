@@ -162,7 +162,7 @@ class MainActivity : AppCompatActivity() {
         AaVideoBridge.previewTouchSink = null
         AaVideoBridge.nightSink = null
         try { AndroidAutoService.stop(this) } catch (e: Exception) { log("AA stop: $e") }
-        try { BikeLink.prober?.stop() } catch (e: Exception) { log("prober stop: $e") }
+        BikeLink.stopBackend()
         try {
             if (::prober.isInitialized && BikeLink.prober !== prober) prober.stop()
         } catch (_: Exception) {}
@@ -819,7 +819,7 @@ class MainActivity : AppCompatActivity() {
         // running — i.e. the mirror path or a genuine exit. Full teardown is the "Stop" button.
         if (!AndroidAutoService.isRunning) {
             AaVideoBridge.onSteadyVideo = null
-            prober.stop()
+            BikeLink.stopBackend()
             bleWakeUp?.stop()
             bleWakeUp = null
             ProjectionHolder.projection?.let { try { it.stop() } catch (_: Exception) {} }
@@ -1281,6 +1281,12 @@ class MainActivity : AppCompatActivity() {
                     }
                 }
             },
+            onDisconnected = {
+                LogBus.log("P2P group lost; stopping bike transport for reconnect")
+                BikeLink.markP2pLost()
+                BikeLink.stopBackend()
+                ConnectionState.set(Phase.PXC_CONNECTING, "Wi-Fi Direct reconnecting")
+            },
             onFailed = { reason ->
                 if (qr.isEylink || qr.pwd.isEmpty() || qr.ssid.startsWith("PHONE-HOTSPOT", ignoreCase = true)) {
                     LogBus.log("P2P join failed: $reason — no SoftAP credentials to fall back to")
@@ -1464,7 +1470,7 @@ class MainActivity : AppCompatActivity() {
         log("→ stopping everything (Android Auto + bike)")
         try { AaVideoBridge.onSteadyVideo = null } catch (_: Exception) {}
         try { AndroidAutoService.stop(this) } catch (e: Exception) { log("AA stop: $e") }
-        try { if (::prober.isInitialized) prober.stop() } catch (e: Exception) { log("prober stop: $e") }
+        BikeLink.stopBackend()
         try { bleWakeUp?.stop() } catch (_: Exception) {}
         bleWakeUp = null
         ProjectionHolder.projection?.let { try { it.stop() } catch (_: Exception) {} }

@@ -100,11 +100,26 @@ object BikeLink {
     /** Wi‑Fi Direct: no [Network] — store bind/gateway IPs and mark ready. */
     @Synchronized
     fun markP2pReady(bindIp: Inet4Address, gatewayIp: Inet4Address) {
+        if (backend == Backend.EYLINK && AndroidAutoService.isParked) {
+            AndroidAutoService.requestResume(P2pEndpoint(bindIp, gatewayIp))
+            return
+        }
         p2pBindIp = bindIp
         p2pGatewayIp = gatewayIp
         bikeNetwork = null
         networkReady = true
         maybeStartProbe()
+    }
+
+    data class P2pEndpoint(val bindIp: Inet4Address, val gatewayIp: Inet4Address)
+
+    /** Invalidate only a lost Eylink P2P group; keep live AA ready for a short outage. */
+    @Synchronized
+    fun markP2pLost() {
+        if (backend != Backend.EYLINK) return
+        networkReady = false
+        p2pBindIp = null
+        p2pGatewayIp = null
     }
 
     private fun maybeStartProbe() {
@@ -156,7 +171,7 @@ object BikeLink {
                     return
                 }
 
-                LogBus.log("AA video + Kove P2P ready; starting Eylink flow")
+                LogBus.log("AA video + EyLink P2P ready; starting EyLink flow")
 
                 val ok = try {
                     link.connectAndStream(
@@ -173,6 +188,20 @@ object BikeLink {
                     proberStarted = false
                     ConnectionState.set(Phase.ERROR, "Eylink connection failed")
                 }
+            }
+        }
+    }
+
+    /** Stop only the active bike transport. The shared Android Auto pipeline is owned elsewhere. */
+    @Synchronized
+    fun stopBackend() {
+        proberStarted = false
+        when (backend) {
+            Backend.EASYCONN -> {
+                try { prober?.stop() } catch (_: Exception) {}
+            }
+            Backend.EYLINK -> {
+                try { eylink?.stop() } catch (_: Exception) {}
             }
         }
     }

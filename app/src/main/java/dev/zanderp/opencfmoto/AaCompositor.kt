@@ -406,8 +406,8 @@ class AaCompositor(private val log: (String) -> Unit) {
     private fun drawFrame() {
         if (windowSurface == EGL14.EGL_NO_SURFACE && previewSurface == EGL14.EGL_NO_SURFACE) return
         surfaceTexture.getTransformMatrix(texMatrix)
-        if (windowSurface != EGL14.EGL_NO_SURFACE) renderTo(windowSurface, vpX, canvasH - vpY - vpH, vpW, vpH)
-        if (previewSurface != EGL14.EGL_NO_SURFACE) renderTo(previewSurface, ppX, previewH - ppY - ppH, ppW, ppH)
+        if (windowSurface != EGL14.EGL_NO_SURFACE) renderTo(windowSurface, vpX, vpY, vpW, vpH)
+        if (previewSurface != EGL14.EGL_NO_SURFACE) renderTo(previewSurface, ppX, ppY, ppW, ppH)
         lastDrawMs = android.os.SystemClock.uptimeMillis()
         pendingFrame = false
     }

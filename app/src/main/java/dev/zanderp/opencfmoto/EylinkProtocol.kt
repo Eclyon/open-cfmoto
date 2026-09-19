@@ -26,7 +26,6 @@ package dev.zanderp.opencfmoto
  * The VIDEO checksum covers ONLY the H.264 Annex-B bytes, not the timestamp.
  */
 object EylinkProtocol {
-    const val DEFAULT_HOST = "192.168.13.1"
     const val VIDEO_PORT = 11111
     const val CONTROL_PORT = 11113
 
